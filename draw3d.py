@@ -28,7 +28,7 @@ class Render:
         raise NotImplemented()
 
 
-# hex цвет в rgb
+# конвертировать цвет из hex в rgb '#FF00FF -> np.array(255, 0, 255)
 def hex_to_rgb(color):
     if isinstance(color, str):
         if color[0] == '#':
@@ -41,7 +41,7 @@ def hex_to_rgb(color):
         return color
 
 
-# rgb цвет в hex
+# конвертировать rgb цвет в hex, (255, 0, 0) -> '#FF0000'
 def rgb_to_hex(rgb):
     r, g, b = rgb
     return f'#{int(r):02x}{int(g):02x}{int(b):02x}'
@@ -90,7 +90,7 @@ class Transform:
     @property
     def matrix(self):
         """
-        Совмещенная матрица всех преобразований
+        Собрать все преобразования в одну матрицу 4x4
         """
         # масштабирование
         scale = np.diag([self.sx, self.sy, self.sz, 1.0])
@@ -104,7 +104,7 @@ class Transform:
     @property
     def rot(self):
         """
-        Матрица вращения
+        Преобразовать углы эйлера (teta, phi, pis) в матрицу вращения
         """
         x = np.matrix([[1, 0, 0, 0],
                        [0, cos(self.phi), -sin(self.phi), 0],
@@ -125,24 +125,19 @@ class Transform:
 
 # параметры камеры/ наблюдателя
 class View:
-    def __init__(self,  w=400, h=300, distance=200, persp=False, transform=None):
+    def __init__(self,  w=400, h=300, d=200, persp=False):
         """
         :param w: ширина в пикселях
         :param h: высота в пикселях
-        :distance: расстояние зрителя от центра сцены
         :persp: включить/выключить перспективные преобразования
-        :transform: готовая матрица для видовых преобразований
         """
-        if transform is None:
-            transform = Transform()
 
-        self.transform = transform
+        self.transform = Transform()
 
         self.w = w
         self.h = h
         self.persp = persp
-        self.distance = distance
-        self.transform = transform
+        self.d = d
 
     def to_screen(self, points):
         res = []
@@ -152,9 +147,9 @@ class View:
             # требуется перспективное преобразование
             if self.persp:
                 z = z-500
-                if z == 0.0:
-                    z = 0.000001
-                f = self.distance/z
+                if z == 0:
+                    z = 1
+                f = self.d/z
                 x = int(x*f) + self.w//2
                 y = int(y*f) + self.h//2
             else:
@@ -184,7 +179,7 @@ class Object3D:
         # устанавливаем матрицу трансформации для объекта
         self.transform = Transform(pos[0], pos[1], pos[2], rot[0], rot[1], rot[2], scale[0], scale[1], scale[2])
 
-    # примитивы для рисования, в формате (список индексов, z-координата, цвет)
+    # преобразовать геометрию объекта в примитивы(треугольники) для рисования, в формате (список индексов, z-координата, цвет)
     def get_geometry(self, transform: Transform):
         raise NotImplemented()
 
@@ -216,8 +211,15 @@ class Poly3D(Object3D):
 
         points = (self.V.T * M)[:, 0:3]
 
-        # список готовых треугольников с координатами каждой точки
+        # получаем список готовых треугольников с координатами каждой точки
+        # p[0] - список граней для каждого треугольника в self.polys, например (0, 1, 2)
+        # points[(0, 1, 2), :] - из списка points получаем координаты точек для треугольника
+        # np.concatenate - получам np.array из списка списков точек
+        # .reshape(len(self.polys), 3, 3) приводит его к следующей форме
+        # [[[0,0,0], [0, 1, 0.5], [1, 1, 1]], ...]
         triangles = np.concatenate([np.array(points[p[0], :]) for p in self.polys]).reshape(len(self.polys), 3, 3)
+
+        # все цвета из hex конвертируем в rgb
         colors = [hex_to_rgb(p[1]) for p in self.polys]
 
         return triangles, colors
@@ -317,17 +319,18 @@ def zorder(p):
 
 # 3d сцена
 class Scene:
-    def __init__(self, view=None, render: Render=None, flat_shading=True):
+    def __init__(self, view=None, render: Render=None, flat_shading=True, backface_cull=False):
         """
         :param view: настройки камеры/зрителя
         :param render: класс, который рисует
         :param flat_shading: включить плоское закрашивание
-        :param light_pos: координаты источника света
+        :param backface_cull: отсечение невидимых граней
         :param objects:
         """
         self.view = view
         self.render = render
         self.objects = []
+        self.backface_cull = backface_cull
         self.flat_shading = flat_shading
 
     def add_object(self, obj):
@@ -341,7 +344,7 @@ class Scene:
         colors = []
 
         for obj in self.objects:
-            # геоме
+            # геометрия
             tris, cols = obj.get_geometry(transform=self.view.transform)
             triangles.extend(tris)
             colors.extend(cols)
@@ -362,20 +365,29 @@ class Scene:
 
         # вместо самих треугольников сортируем их индексы
         for i in sorted(range(len(triangles)), key=by_z):
-            v = triangles[i]
+            # отсекаем невидимые грани, нормаль которых повернута от наблюдателя
 
-            # TODO: back-face culling
-            #if normals[i][2] > 0:
-            #    continue
+            if isnan(normals[i][2]):
+                continue
 
-            p = self.view.to_screen(v)
+            if self.backface_cull:
+                if normals[i][2] > 0:
+                    continue
 
-            # преобразуем к экранным координатам
+            # преобразуем треугольник к экранным координатам
+            p = self.view.to_screen(triangles[i])
+            
             self.render.draw_tri(p[0], p[1], p[2], colors[i])
+
+            # рисуем красный wireframe, для отладки
+            # red = (255, 0, 0)
+            # self.render.draw_line(p[0], p[1], 1, red)
+            # self.render.draw_line(p[1], p[2], 1, red)
+            # self.render.draw_line(p[2], p[0], 1, red)
 
 w = 600
 h = 400
-v = View(w, h, distance=200, persp=True)
+v = View(w, h, d=200, persp=True)
 
 from tkinter import *
 
